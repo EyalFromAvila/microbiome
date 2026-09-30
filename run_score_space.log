@@ -1,0 +1,37 @@
+Total Subjects: 1738
+Complete Subjects (Both Omics & Metadata): 1042
+
+============================================================
+MAIN SPLIT (same train/test split and masks as pipeline.py)
+============================================================
+                    Pipeline  Mantel_r  P_Value                   Params  Tune_s   Run_s
+    Global KNN50 (Benchmark)    0.5897    0.001                        -  0.0000  0.5305
+         Ridge (score space)    0.6037    0.001                        -  0.0000  0.3531
+  MKC_embd(ht) (score space)    0.6104    0.001 {'c1': 10.0, 'c2': 0.01} 36.6250 24.6969
+SNF neighbours (score space)    0.6054    0.001  {'K': 20, 'k_pred': 60}  2.8655  0.9150
+  Ridge (score space) | ridge alpha (mb missing): 316.22776601683796
+  Ridge (score space) | ridge alpha (mt missing): 1778.2794100389228
+  MKC_embd(ht) (score space) | MKC view weights s_ml (rows: mb, mt, meta): [[0.0, 0.5, 0.5], [0.5, 0.0, 0.5], [0.5, 0.5, 0.0]]
+  MKC_embd(ht) (score space) | MKC active basis samples per view: {'mb': 833, 'mt': 833, 'meta': 833}
+  MKC_embd(ht) (score space) | MKC objective after each outer round: [27.166, 26.3, 25.905, 25.645]
+
+============================================================
+PAIRED COMPARISON OVER 10 RANDOM SPLITS (tuned inside each split)
+============================================================
+split 0: Global KNN50=0.672  Ridge=0.687  MKC_embd(ht)=0.677  SNF neighbours=0.675
+split 1: Global KNN50=0.683  Ridge=0.708  MKC_embd(ht)=0.703  SNF neighbours=0.705
+split 2: Global KNN50=0.571  Ridge=0.599  MKC_embd(ht)=0.596  SNF neighbours=0.603
+split 3: Global KNN50=0.587  Ridge=0.619  MKC_embd(ht)=0.615  SNF neighbours=0.613
+split 4: Global KNN50=0.492  Ridge=0.507  MKC_embd(ht)=0.507  SNF neighbours=0.515
+split 5: Global KNN50=0.500  Ridge=0.553  MKC_embd(ht)=0.533  SNF neighbours=0.549
+split 6: Global KNN50=0.666  Ridge=0.680  MKC_embd(ht)=0.679  SNF neighbours=0.674
+split 7: Global KNN50=0.640  Ridge=0.666  MKC_embd(ht)=0.666  SNF neighbours=0.667
+split 8: Global KNN50=0.687  Ridge=0.706  MKC_embd(ht)=0.702  SNF neighbours=0.703
+split 9: Global KNN50=0.576  Ridge=0.608  MKC_embd(ht)=0.607  SNF neighbours=0.624
+
+                              mean_r    sd_r  mean_gain_vs_KNN50  sd_gain  wins_vs_KNN50
+Pipeline                                                                                
+Global KNN50 (Benchmark)      0.6075  0.0731              0.0000   0.0000              0
+Ridge (score space)           0.6333  0.0678              0.0259   0.0117             10
+MKC_embd(ht) (score space)    0.6285  0.0688              0.0210   0.0091             10
+SNF neighbours (score space)  0.6327  0.0641              0.0252   0.0149             10

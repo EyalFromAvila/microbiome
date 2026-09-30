@@ -1,0 +1,40 @@
+Total Subjects: 1738
+Complete Subjects (Both Omics & Metadata): 1042
+
+Calculating Ground Truth Geometry...
+
+--- Running Pipeline 1: Global KNN50 (Benchmark) ---
+
+--- Preparing Stratified Imputations ---
+--- Running Pipeline 2: Stratified KNN5 + SNF ---
+
+--- Running Constrained MKC Hyperparameter Grid Search ---
+Tested lambda1=  0.1, lambda2= 0.01 -> Mantel r = -0.0056
+Tested lambda1=  0.1, lambda2=  0.1 -> Mantel r = 0.0071
+Tested lambda1=  0.1, lambda2=  1.0 -> Mantel r = 0.0119
+Tested lambda1=  0.1, lambda2= 10.0 -> Mantel r = -0.0162
+Tested lambda1=  1.0, lambda2= 0.01 -> Mantel r = -0.0049
+Tested lambda1=  1.0, lambda2=  0.1 -> Mantel r = 0.0186
+Tested lambda1=  1.0, lambda2=  1.0 -> Mantel r = 0.0104
+Tested lambda1=  1.0, lambda2= 10.0 -> Mantel r = 0.0038
+Tested lambda1= 10.0, lambda2= 0.01 -> Mantel r = -0.0082
+Tested lambda1= 10.0, lambda2=  0.1 -> Mantel r = -0.0085
+Tested lambda1= 10.0, lambda2=  1.0 -> Mantel r = -0.0055
+Tested lambda1= 10.0, lambda2= 10.0 -> Mantel r = -0.0123
+Tested lambda1=100.0, lambda2= 0.01 -> Mantel r = 0.0093
+Tested lambda1=100.0, lambda2=  0.1 -> Mantel r = 0.0015
+Tested lambda1=100.0, lambda2=  1.0 -> Mantel r = -0.0038
+Tested lambda1=100.0, lambda2= 10.0 -> Mantel r = 0.0118
+Best Parameters Selected: lambda1=1.0, lambda2=0.1
+
+--- Running Pipeline 3: Constrained MKC (Average) ---
+--- Running Pipeline 4: Constrained MKC + SNF ---
+
+============================================================
+PIPELINE COMPARISON GRADES (Mantel r vs Ground Truth)
+============================================================
+                   Pipeline  Mantel_r  P_Value
+1. Global KNN50 (Benchmark)  0.589665    0.001
+   2. Stratified KNN5 + SNF  0.061815    0.001
+   3. Constrained MKC (Avg)  0.003902    0.351
+   4. Constrained MKC + SNF -0.010592    0.693

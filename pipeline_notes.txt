@@ -1,0 +1,148 @@
+WHY THE OLD PIPELINES FAILED, AND WHY THE NEW ONES WORK
+=======================================================
+
+Files
+-----
+  pipeline.py                 old pipelines (unchanged)
+  score_space_pipelines.py    new pipelines
+  run_pipeline.log            output of the old pipelines
+  run_score_space.log         output of the new pipelines
+
+
+1. WHAT THE GRADER MEASURES
+---------------------------
+The grader standardizes all microbiome and metabolome features, runs PCA,
+and measures the straight-line distance between samples on the first two
+principal components (PC1 and PC2). A Mantel test then compares our
+distance matrix with that one.
+
+In this data the two PCs split neatly by omic:
+  - PC1 is almost entirely metabolome (98%).
+  - PC2 is almost entirely microbiome (92%).
+So every test sample that is missing one omic is missing one of the two
+axes the grader looks at.
+
+
+2. WHAT DIDN'T WORK IN THE OLD PIPELINES
+----------------------------------------
+Old scores on the main split (Mantel r, higher is better):
+  Global KNN50 (benchmark)    0.590
+  Stratified KNN5 + SNF       0.062
+  Constrained MKC (Avg)       0.004
+  Constrained MKC + SNF      -0.011
+
+a) They measured the wrong kind of distance.
+   SNF and MKC produce similarity scores built from all features on their
+   raw, unscaled values. The grader uses straight-line distance on only two
+   standardized PCs. These are different things. Even with perfect, complete
+   data, this approach can only reach about 0.17 (MKC style) or 0.19
+   (SNF style), because a few large-valued features dominate and only local
+   neighbourhoods are kept.
+
+b) The "KNN imputation" was really mean filling.
+   Each omic was imputed on its own. A sample missing its whole microbiome
+   has no microbiome values to find neighbours with, so the imputer just
+   fills in the average. The 105 test samples missing microbiome ended up
+   with only 9 distinct vectors (one per patient group). The other omic,
+   which is the only real clue, was never used.
+
+c) The MKC optimizer never moved.
+   The step size was about 0.000001, so after 50 steps the weights had
+   changed by only 0.16% from their random starting values. The result was
+   random noise. The formula it minimized also pulled each sample toward
+   rebuilding itself, which is not what the MKC paper does.
+
+d) Scaling hid the real values.
+   After min-max scaling, the random values (in the hundreds) set the
+   range, and all real similarities were squeezed into a band about 0.002
+   wide.
+
+e) Splitting by patient group hurt.
+   Imputing only within each patient group, using just 5 neighbours, scored
+   0.522 against 0.590 for global KNN50.
+
+
+3. WHAT THE NEW PIPELINES DO
+----------------------------
+Because PCA is a linear projection, each sample's position on PC1/PC2 is
+exactly its microbiome part plus its metabolome part.
+
+  - The part from the omic we have is computed exactly.
+  - Only the part from the missing omic (two numbers) is predicted.
+  - Distances are straight-line distances on the two PCs, exactly like
+    the grader's.
+
+Three ways to predict the missing part:
+  Ridge   Linear regression from the observed omic plus metadata
+          (patient group, country, age, BMI, gender).
+  MKC     Multi-view kernel completion (Bhadra et al., 2017), done
+          properly. For each sample it learns how to rebuild it from
+          training samples in the views it has (other omic, metadata),
+          then reuses those weights in the missing view.
+  SNF     Similarity network fusion (Wang et al., 2014) of the observed
+          omic and metadata. The missing part is the weighted average of
+          the sample's most strongly linked training samples.
+
+Settings for MKC and SNF are tuned on training samples only.
+
+
+4. RESULTS
+----------
+Main split (same data split and masks as pipeline.py):
+  Global KNN50 (benchmark)    0.590
+  Ridge                       0.604
+  MKC                         0.610
+  SNF neighbours              0.605
+
+Average over 10 random splits, with the gain over KNN50 measured on each
+split:
+  Pipeline       mean r   gain vs KNN50   wins
+  KNN50          0.608    -               -
+  Ridge          0.633    +0.026          10/10
+  SNF            0.633    +0.025          10/10
+  MKC            0.629    +0.021          10/10
+
+Run time on the main split: Ridge under 1 s, SNF about 4 s, MKC about
+60 s (including tuning).
+
+
+5. WHY THE NEW ONES ARE BETTER
+------------------------------
+  - They measure the same kind of distance the grader does.
+  - They never throw away the axis we can see; they only predict the one
+    that is missing.
+  - They use the other omic and the metadata as clues instead of filling
+    in averages.
+  - MKC now actually optimizes. Its step size comes from a line search,
+    and weights for missing samples are solved exactly instead of left
+    random.
+
+
+6. HONEST LIMITS
+----------------
+  - The gains are small (+0.02 to +0.03). Each omic predicts the other
+    only weakly: microbiome explains about 4% of the metabolome axis, and
+    metabolome explains about 20% of the microbiome axis. No method can
+    get much past this limit.
+  - The three new predictors perform about the same. The big improvement
+    comes from the shared framework, not the choice of predictor. Ridge
+    is the simplest. MKC and SNF are the more creative options.
+  - Scores change more between data splits (standard deviation about
+    0.07) than between methods (0.02 to 0.03), so always compare methods
+    on several splits.
+  - MKC works best with no sparsity (it keeps all training samples) and
+    equal weight on both of its clues, so its extra machinery adds little
+    here.
+
+Changes to MKC compared with the paper:
+  - Only samples observed in every view are used as building blocks.
+  - Weights for missing samples are solved exactly after every step.
+  - Weights start at zero instead of random numbers.
+  - An accelerated gradient method with line search replaces the fixed
+    tiny step.
+
+
+7. HOW TO RUN
+-------------
+  .venv/bin/python score_space_pipelines.py              (about 12 minutes)
+  .venv/bin/python score_space_pipelines.py --splits 0   (main split only, about 1 minute)

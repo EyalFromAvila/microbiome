@@ -1,0 +1,31 @@
+Total Subjects: 1738
+Complete Subjects (Both Omics): 1042
+
+Calculating Ground Truth Geometry...
+
+--- Running Pipeline 1: KNN50 ---
+--- Running Pipeline 2: KNN + SNF ---
+
+--- Running MKC Hyperparameter Grid Search ---
+Tested lambda1=0.1, lambda2=0.1 -> Mantel r = -0.0008
+Tested lambda1=0.1, lambda2=0.5 -> Mantel r = 0.0070
+Tested lambda1=0.1, lambda2=1.0 -> Mantel r = -0.0122
+Tested lambda1=1.0, lambda2=0.1 -> Mantel r = 0.0084
+Tested lambda1=1.0, lambda2=0.5 -> Mantel r = -0.0004
+Tested lambda1=1.0, lambda2=1.0 -> Mantel r = -0.0045
+Tested lambda1=10.0, lambda2=0.1 -> Mantel r = 0.0010
+Tested lambda1=10.0, lambda2=0.5 -> Mantel r = -0.0090
+Tested lambda1=10.0, lambda2=1.0 -> Mantel r = -0.0056
+Best Parameters Selected: lambda1=1.0, lambda2=0.1
+
+--- Running Pipeline 3: MKC (Average) ---
+--- Running Pipeline 4: MKC + SNF ---
+
+============================================================
+PIPELINE COMPARISON GRADES (Mantel r vs Ground Truth)
+============================================================
+         Pipeline  Mantel_r  P_Value
+            KNN50  0.589665    0.001
+        KNN + SNF  0.014232    0.135
+MKC_embd_ht (Avg) -0.000746    0.502
+MKC_embd_ht + SNF -0.002252    0.535
