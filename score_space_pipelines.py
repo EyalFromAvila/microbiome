@@ -1,6 +1,6 @@
 """
 Score-Space Pipelines
-Three predictors of the missing omic, graded with the same Mantel test as pipeline.py.
+Four predictors of the missing omic, graded with the same Mantel test as pipeline.py.
 
 The ground truth is Euclidean distance on the first two principal components of the
 standard-scaled microbiome + metabolome features. PCA is linear, so each sample's score
@@ -17,6 +17,9 @@ Predictors of the missing part:
    views where a sample is observed and transferred to the view where it is missing
 3. SNF neighbours (Wang et al., 2014): the observed omic and metadata fused into one
    similarity network whose strongest links average the training samples' scores
+4. miss-SNF (Gliozzo et al., 2025): all three views fused over all samples at once; a sample
+   missing an omic enters that omic's network through a self-loop, and message passing from
+   the views it does have recovers its links there
 """
 
 import argparse
@@ -36,6 +39,8 @@ from pipeline import (
     RANDOM_STATE,
     TEST_SIZE,
     apply_mask,
+    full_kernel,
+    knn_kernel,
     load_data,
     make_mask,
     mantel_test,
@@ -90,7 +95,7 @@ def metadata_features(metadata):
     return features.loc[:, ~features.T.duplicated()]
 
 # ==========================================
-# 2. SCORE SPACE (SHARED BY ALL THREE PREDICTORS)
+# 2. SCORE SPACE (SHARED BY ALL FOUR PREDICTORS)
 # ==========================================
 
 class ScoreSpace:
@@ -354,7 +359,95 @@ def snf_predictor(ctx, K=20, k_pred=20, T=20, mu=0.5):
     return predictions
 
 # ==========================================
-# 6. TUNING & EVALUATION
+# 6. PREDICTOR 4: MISS-SNF
+# ==========================================
+
+MISS_SNF_SELF_LOOP = {"one": 1.0, "equidistant": 0.5, "zero": 0.0}
+
+
+def _normalized(P):
+    P = full_kernel(P)
+    return (P + P.T) / 2.0
+
+
+def miss_snf(affinities, observed, K=20, T=20, strategy="one"):
+    """
+    SNF for partial data (Gliozzo et al., 2025).
+
+    affinities[v] is the affinity matrix of view v among the samples observed in it and
+    observed[v] the boolean mask of those samples; the result is one fused n x n network.
+    A sample i with view s entirely missing has no row in W(s), P(s), S(s), so the update
+    P(s) <- S(s) @ mean(P(v != s)) @ S(s).T could not reach it. miss-SNF writes that row by hand:
+      - "one":         self-loop 1, nothing else. Row i of the update becomes
+                       P(s)(i, j) = sum_l mean_P(i, l) * S(s)(j, l): i is linked to j in the
+                       missing view when its neighbours in the other views are j's neighbours in s.
+      - "equidistant": self-loop 0.5 and 0.5 / (n - 1) to every other sample.
+      - "zero":        no self-loop; the sample is ignored in view s and the fused network
+                       averages each pair over the views where both samples are observed.
+    """
+    n, m = len(observed[0]), len(affinities)
+    self_loop = MISS_SNF_SELF_LOOP[strategy]
+    partial = [np.where(~np.asarray(obs))[0] for obs in observed]
+    P, S = [], []
+    for A, obs, miss in zip(affinities, observed, partial):
+        W = np.zeros((n, n))
+        W[np.ix_(obs, obs)] = (A + A.T) / 2.0
+        if strategy == "equidistant":
+            W[miss, :] = W[:, miss] = 0.5 / (n - 1)
+        W[miss, miss] = self_loop
+        global_net = _normalized(W)
+        global_net[miss, :], global_net[:, miss] = W[miss, :], W[:, miss]
+        local_net = W.copy()
+        local_net[miss, miss] = 1.0                      # keeps the row normalisation in knn_kernel finite
+        local_net = knn_kernel(local_net, K)
+        local_net[miss, :] = W[miss, :]                  # partial rows are set by the strategy, not by KNN
+        P.append(global_net)
+        S.append(local_net)
+
+    for _ in range(T):
+        previous = P
+        P = []
+        for v in range(m):
+            others = sum(previous[u] for u in range(m) if u != v) / (m - 1)
+            updated = _normalized(S[v] @ others @ S[v].T)
+            if strategy == "zero":
+                updated[partial[v], :] = updated[:, partial[v]] = 0.0
+            P.append(updated)
+
+    if strategy == "zero":
+        available = sum(np.outer(obs, obs).astype(float) for obs in observed)
+        fused = sum(P) / np.maximum(available, 1.0)
+    else:
+        fused = sum(P) / m
+    return (fused + fused.T) / 2.0
+
+
+def miss_snf_predictor(ctx, K=20, k_pred=20, T=20, mu=0.5, strategy="one"):
+    """
+    Missing omic's contribution = weighted mean over the query's strongest miss-SNF links to training samples.
+
+    Unlike snf_predictor, one network is fused over all samples and all three views, including the
+    omic being predicted: its structure among the samples that have it shapes the fused links.
+    """
+    views = ("mb", "mt", "meta")
+    index = ctx.contributions["mb"].index
+    observed = [ctx.views[view].notna().all(axis=1).to_numpy() for view in views]
+    affinities = [
+        local_affinity(ctx.standardized(view, index[obs]), K, mu) for view, obs in zip(views, observed)
+    ]
+    fused = pd.DataFrame(miss_snf(affinities, observed, K=K, T=T, strategy=strategy), index=index, columns=index)
+
+    predictions = {}
+    for omic in OMICS:
+        links = fused.loc[ctx.missing(omic), ctx.train_ids].to_numpy()
+        kth_strongest = -np.partition(-links, k_pred - 1, axis=1)[:, [k_pred - 1]]
+        links = np.where(links >= kth_strongest, links, 0.0)
+        weights = links / np.maximum(links.sum(axis=1, keepdims=True), np.finfo(float).eps)
+        predictions[omic] = weights @ ctx.contributions[omic].loc[ctx.train_ids].to_numpy()
+    return predictions
+
+# ==========================================
+# 7. TUNING & EVALUATION
 # ==========================================
 
 def grid(**axes):
@@ -365,6 +458,10 @@ METHODS = {
     "Ridge (score space)": (ridge_predictor, [{}]),
     "MKC_embd(ht) (score space)": (mkc_predictor, grid(c1=[0.1, 10.0], c2=[0.01, 1.0, 10.0])),
     "SNF neighbours (score space)": (snf_predictor, grid(K=[10, 20, 40], k_pred=[10, 30, 60])),
+    "miss-SNF (score space)": (
+        miss_snf_predictor,
+        grid(strategy=["one", "equidistant"], K=[10, 20, 40], k_pred=[10, 30, 60]),
+    ),
 }
 
 
@@ -411,7 +508,7 @@ def parse_args():
     return parser.parse_args()
 
 # ==========================================
-# 7. EXECUTION
+# 8. EXECUTION
 # ==========================================
 
 if __name__ == "__main__":
