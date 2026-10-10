@@ -20,12 +20,30 @@ Predictors of the missing part:
 4. miss-SNF (Gliozzo et al., 2025): all three views fused over all samples at once; a sample
    missing an omic enters that omic's network through a self-loop, and message passing from
    the views it does have recovers its links there
+
+Two reference points sit next to them:
+- Global KNN50 (the Milestone 1 benchmark). It keeps the observed features untouched and PCA is
+  linear, so it too gets the observed omic's part exactly and only fills in the missing part,
+  with a 50-neighbour average. The gain of the predictors above over KNN50 is therefore the gain
+  of a better predictor of the missing part, not of the score-space decomposition itself.
+- Mean fill: the missing part is set to the training mean. This is the floor, the score of a
+  pipeline that learns nothing about the missing omic.
+
+Experiments (all results are also written to --out as CSV, plus one figure):
+- Main split: same split and masks as pipeline.py, with Mantel r, p-value, tuning time and
+  prediction time for every pipeline.
+- Paired comparison over random splits: Mantel r, gain over KNN50 and mean run time.
+- Missing-percentage sweep: one omic is hidden in 10% to 80% of ALL samples, so the pool of
+  complete reference samples shrinks as the percentage grows. Scored against the grader's
+  geometry (PCA fitted on every sample's true values), over all samples and over the samples
+  missing an omic only.
 """
 
 import argparse
 import itertools
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -77,6 +95,26 @@ def make_split(complete, mb_cols, mt_cols, test_size, split_seed, mask_seed):
     return Split(train, combined, masked_ids, pca_distance(train, test.loc[masked_ids]))
 
 
+def make_missing_split(complete, mb_cols, mt_cols, missing_fraction, seed):
+    """
+    Hide one omic in a fraction of ALL samples (half lose the metabolome, half the microbiome).
+
+    The untouched samples are the only reference the pipelines may learn from, so a higher
+    fraction means both more samples to fill in and fewer samples to learn from. The ground truth
+    is the grader's: PCA fitted on the true values of every sample, hidden ones included, with
+    distances over all samples. For one seed the hidden sets are nested across fractions.
+    """
+    rng = np.random.default_rng(seed)
+    ids = rng.permutation(np.asarray(complete.index))
+    n_masked = int(round(missing_fraction * len(ids)))
+    masked, kept = ids[:n_masked], ids[n_masked:]
+    miss_mt, miss_mb = make_mask(masked, rng)
+    train = complete.loc[kept]
+    combined = pd.concat([train, apply_mask(complete.loc[masked], miss_mt, miss_mb, mb_cols, mt_cols)])
+    masked_ids = np.concatenate([miss_mt, miss_mb])
+    return Split(train, combined, masked_ids, pca_distance(complete, complete.loc[combined.index]))
+
+
 def omic_features(block, omic):
     """Log-ratio inputs for the predictors (CLR for the compositional microbiome); the target geometry stays raw."""
     logged = np.log(block + PSEUDOCOUNT)
@@ -95,7 +133,7 @@ def metadata_features(metadata):
     return features.loc[:, ~features.T.duplicated()]
 
 # ==========================================
-# 2. SCORE SPACE (SHARED BY ALL FOUR PREDICTORS)
+# 2. SCORE SPACE (SHARED BY ALL PREDICTORS)
 # ==========================================
 
 class ScoreSpace:
@@ -147,6 +185,14 @@ def score_space_distance(split, meta, mb_cols, mt_cols, predictor, **params):
     coords = ctx.contributions["mb"] + ctx.contributions["mt"]
     distances = pd.DataFrame(cdist(coords, coords), index=coords.index, columns=coords.index)
     return distances, ctx.diagnostics
+
+
+def mean_predictor(ctx):
+    """Floor: the missing omic's contribution is its training mean (what mean imputation of that omic gives)."""
+    return {
+        omic: np.tile(ctx.contributions[omic].loc[ctx.train_ids].mean().to_numpy(), (len(ctx.missing(omic)), 1))
+        for omic in OMICS
+    }
 
 # ==========================================
 # 3. PREDICTOR 1: RIDGE REGRESSION
@@ -347,6 +393,7 @@ def local_affinity(X, K=20, mu=0.5):
 def snf_predictor(ctx, K=20, k_pred=20, T=20, mu=0.5):
     """Missing omic's contribution = weighted mean over the query's strongest fused links to training samples."""
     n_train = len(ctx.train_ids)
+    k_pred = min(k_pred, n_train)
     predictions = {}
     for omic in OMICS:
         nodes = ctx.train_ids.append(ctx.missing(omic))
@@ -437,6 +484,7 @@ def miss_snf_predictor(ctx, K=20, k_pred=20, T=20, mu=0.5, strategy="one"):
     ]
     fused = pd.DataFrame(miss_snf(affinities, observed, K=K, T=T, strategy=strategy), index=index, columns=index)
 
+    k_pred = min(k_pred, len(ctx.train_ids))
     predictions = {}
     for omic in OMICS:
         links = fused.loc[ctx.missing(omic), ctx.train_ids].to_numpy()
@@ -455,6 +503,7 @@ def grid(**axes):
 
 
 METHODS = {
+    "Mean fill (score space floor)": (mean_predictor, [{}]),
     "Ridge (score space)": (ridge_predictor, [{}]),
     "MKC_embd(ht) (score space)": (mkc_predictor, grid(c1=[0.1, 10.0], c2=[0.01, 1.0, 10.0])),
     "SNF neighbours (score space)": (snf_predictor, grid(K=[10, 20, 40], k_pred=[10, 30, 60])),
@@ -465,9 +514,14 @@ METHODS = {
 }
 
 
-def evaluate(split, distances, n_permutations):
-    masked = split.masked_ids
-    return mantel_test(split.ground_truth, distances.loc[masked, masked], n_permutations=n_permutations)
+def short(name):
+    return name.split(" (")[0]
+
+
+def evaluate(split, distances, n_permutations, ids=None):
+    """Mantel r and p-value over `ids` (default: the samples missing an omic)."""
+    ids = split.masked_ids if ids is None else ids
+    return mantel_test(split.ground_truth.loc[ids, ids], distances.loc[ids, ids], n_permutations=n_permutations)
 
 
 def tune(predictor, param_grid, train, meta, mb_cols, mt_cols):
@@ -482,37 +536,126 @@ def tune(predictor, param_grid, train, meta, mb_cols, mt_cols):
     return param_grid[int(np.argmax(scores))]
 
 
-def compare_on_split(split, meta, mb_cols, mt_cols, n_permutations):
+def run_all(split, meta, mb_cols, mt_cols, fixed_params=None):
+    """
+    Distance matrices over all samples of the split, from the benchmark and from every method.
+
+    Tune_s is the time spent choosing parameters and Run_s the time from the masked data to the
+    distance matrix. Neither includes the Mantel test, so the timings compare the pipelines only.
+    With fixed_params (name -> parameters) tuning is skipped.
+    """
     start = time.perf_counter()
     reconstructed = reconstruct_knn(split.combined, split.train.index, n_neighbors=50)
-    r, p = evaluate(split, pca_distance(split.train, reconstructed.loc[split.masked_ids]), n_permutations)
-    rows = [{"Pipeline": BENCHMARK, "Mantel_r": r, "P_Value": p, "Params": "-",
+    distances = pca_distance(split.train, reconstructed)
+    runs = [{"Pipeline": BENCHMARK, "distances": distances, "params": {}, "diagnostics": {},
              "Tune_s": 0.0, "Run_s": time.perf_counter() - start}]
-    diagnostics = {}
 
     for name, (predictor, param_grid) in METHODS.items():
         start = time.perf_counter()
-        params = tune(predictor, param_grid, split.train, meta, mb_cols, mt_cols)
+        if fixed_params is None:
+            params = tune(predictor, param_grid, split.train, meta, mb_cols, mt_cols)
+        else:
+            params = fixed_params[name]
         tuned = time.perf_counter()
-        distances, diagnostics[name] = score_space_distance(split, meta, mb_cols, mt_cols, predictor, **params)
-        r, p = evaluate(split, distances, n_permutations)
-        rows.append({"Pipeline": name, "Mantel_r": r, "P_Value": p, "Params": params or "-",
+        distances, diagnostics = score_space_distance(split, meta, mb_cols, mt_cols, predictor, **params)
+        runs.append({"Pipeline": name, "distances": distances, "params": params, "diagnostics": diagnostics,
                      "Tune_s": tuned - start, "Run_s": time.perf_counter() - tuned})
-    return pd.DataFrame(rows), diagnostics
+    return runs
+
+
+def compare_on_split(split, meta, mb_cols, mt_cols, n_permutations):
+    """Score every pipeline on the samples missing an omic; returns the table, diagnostics and chosen parameters."""
+    rows, diagnostics, chosen = [], {}, {}
+    for run in run_all(split, meta, mb_cols, mt_cols):
+        r, p = evaluate(split, run["distances"], n_permutations)
+        rows.append({"Pipeline": run["Pipeline"], "Mantel_r": r, "P_Value": p, "Params": run["params"] or "-",
+                     "Tune_s": run["Tune_s"], "Run_s": run["Run_s"]})
+        if run["Pipeline"] != BENCHMARK:
+            diagnostics[run["Pipeline"]] = run["diagnostics"]
+            chosen[run["Pipeline"]] = run["params"]
+    return pd.DataFrame(rows), diagnostics, chosen
+
+# ==========================================
+# 8. MISSING-PERCENTAGE SWEEP
+# ==========================================
+
+def missing_sweep(complete, meta, mb_cols, mt_cols, fractions, n_seeds, fixed_params):
+    """
+    Mantel r of every pipeline as the share of samples missing an omic grows.
+
+    r_all is scored over all samples, complete ones included, which is how a submitted n x n
+    matrix is graded. r_masked is scored over the samples missing an omic only, which isolates
+    how well the missing part is predicted. Run_s includes tuning when fixed_params is None.
+    """
+    rows = []
+    for fraction in fractions:
+        for seed in range(n_seeds):
+            split = make_missing_split(complete, mb_cols, mt_cols, fraction, seed)
+            everyone = split.combined.index
+            for run in run_all(split, meta, mb_cols, mt_cols, fixed_params):
+                rows.append({
+                    "Missing_fraction": fraction,
+                    "Seed": seed,
+                    "Pipeline": run["Pipeline"],
+                    "Complete_samples": len(split.train),
+                    "r_all": evaluate(split, run["distances"], 0, everyone)[0],
+                    "r_masked": evaluate(split, run["distances"], 0)[0],
+                    "Run_s": run["Tune_s"] + run["Run_s"],
+                })
+            latest = rows[-(len(METHODS) + 1):]
+            print(f"missing {fraction:.0%} seed {seed} (r_all): "
+                  + "  ".join(f"{short(row['Pipeline'])}={row['r_all']:.3f}" for row in latest))
+    return pd.DataFrame(rows)
+
+
+def plot_sweep(sweep, path):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib is not installed: figure skipped (the numbers are in the CSV files)")
+        return
+    panels = (("r_all", "All samples (as graded)"), ("r_masked", "Samples missing an omic only"))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharex=True)
+    for ax, (column, title) in zip(axes, panels):
+        stats = sweep.groupby(["Pipeline", "Missing_fraction"], sort=False)[column].agg(["mean", "std"])
+        for name in sweep["Pipeline"].unique():
+            line = stats.loc[name]
+            ax.errorbar(line.index * 100, line["mean"], yerr=line["std"].fillna(0.0),
+                        marker="o", capsize=3, linewidth=1.5, label=short(name))
+        ax.set_title(title)
+        ax.set_xlabel("Samples missing one omic (%)")
+        ax.set_ylabel("Mantel r vs ground truth")
+        ax.grid(alpha=0.3)
+    axes[1].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"figure saved to {path}")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Compare score-space predictors against the KNN50 benchmark.")
     parser.add_argument("--splits", type=int, default=10, help="extra random splits for the paired comparison (0 skips)")
     parser.add_argument("--permutations", type=int, default=999, help="Mantel permutations on the main split")
+    parser.add_argument("--sweep-seeds", type=int, default=3, help="repeats per missing fraction in the sweep (0 skips)")
+    parser.add_argument("--fractions", default="0.1,0.2,0.4,0.6,0.8",
+                        help="comma-separated shares of all samples that lose one omic in the sweep")
+    parser.add_argument("--sweep-retune", action="store_true",
+                        help="tune inside every sweep split instead of reusing the main split's parameters (much slower)")
+    parser.add_argument("--out", default="results", help="folder for the CSV tables and the figure")
     return parser.parse_args()
 
 # ==========================================
-# 8. EXECUTION
+# 9. EXECUTION
 # ==========================================
 
 if __name__ == "__main__":
     args = parse_args()
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    order = [BENCHMARK, *METHODS]
     data, complete, mb_cols, mt_cols, metadata = load_data("microbiome.csv", "metabolome.csv", "metadata.csv")
     meta = metadata_features(metadata)
     pd.set_option("display.width", 200)
@@ -522,11 +665,13 @@ if __name__ == "__main__":
     print("MAIN SPLIT (same train/test split and masks as pipeline.py)")
     print("=" * 60)
     main_split = make_split(complete, mb_cols, mt_cols, TEST_SIZE, RANDOM_STATE, RANDOM_STATE + 10_000)
-    results, diagnostics = compare_on_split(main_split, meta, mb_cols, mt_cols, args.permutations)
+    results, diagnostics, main_params = compare_on_split(main_split, meta, mb_cols, mt_cols, args.permutations)
     print(results.round(4).to_string(index=False))
+    print("(Tune_s: choosing parameters. Run_s: masked data to distance matrix. Seconds, Mantel test excluded.)")
     for name, info in diagnostics.items():
         for key, value in info.items():
             print(f"  {name} | {key}: {value}")
+    results.to_csv(out / "main_split.csv", index=False)
 
     if args.splits:
         print("\n" + "=" * 60)
@@ -535,17 +680,47 @@ if __name__ == "__main__":
         per_split = []
         for seed in range(args.splits):
             split = make_split(complete, mb_cols, mt_cols, TEST_SIZE, seed, seed + 10_000)
-            split_results, _ = compare_on_split(split, meta, mb_cols, mt_cols, n_permutations=0)
-            per_split.append(split_results.set_index("Pipeline")["Mantel_r"].rename(seed))
-            print(f"split {seed}: " + "  ".join(f"{k.split(' (')[0]}={v:.3f}" for k, v in per_split[-1].items()))
+            split_results, _, _ = compare_on_split(split, meta, mb_cols, mt_cols, n_permutations=0)
+            per_split.append(split_results.drop(columns="P_Value").assign(Split=seed))
+            print(f"split {seed}: " + "  ".join(
+                f"{short(name)}={r:.3f}" for name, r in zip(split_results["Pipeline"], split_results["Mantel_r"])
+            ))
 
-        table = pd.concat(per_split, axis=1).T
+        paired = pd.concat(per_split, ignore_index=True)
+        table = paired.pivot(index="Split", columns="Pipeline", values="Mantel_r")[order]
         gain = table.sub(table[BENCHMARK], axis=0)
+        seconds = paired.groupby("Pipeline")[["Tune_s", "Run_s"]].mean().loc[order]
         summary = pd.DataFrame({
             "mean_r": table.mean(),
             "sd_r": table.std(),
             "mean_gain_vs_KNN50": gain.mean(),
             "sd_gain": gain.std(),
             "wins_vs_KNN50": (gain > 0).sum().astype(int),
+            "mean_tune_s": seconds["Tune_s"],
+            "mean_run_s": seconds["Run_s"],
         })
         print("\n" + summary.round(4).to_string())
+        paired.to_csv(out / "paired_splits.csv", index=False)
+        summary.to_csv(out / "paired_summary.csv")
+
+    if args.sweep_seeds:
+        fractions = [float(value) for value in args.fractions.split(",")]
+        if not all(0.0 < fraction < 1.0 for fraction in fractions):
+            raise SystemExit("--fractions must lie strictly between 0 and 1")
+        print("\n" + "=" * 60)
+        print(f"MISSING-PERCENTAGE SWEEP ({args.sweep_seeds} repeats per percentage, "
+              + ("tuned inside each split)" if args.sweep_retune else "main-split parameters)"))
+        print("=" * 60)
+        sweep = missing_sweep(complete, meta, mb_cols, mt_cols, fractions, args.sweep_seeds,
+                              None if args.sweep_retune else main_params)
+        grouped = sweep.groupby(["Missing_fraction", "Pipeline"])
+        for column, title in (("r_all", "Mean Mantel r over ALL samples (as graded)"),
+                              ("r_masked", "Mean Mantel r over samples missing an omic only"),
+                              ("Run_s", "Mean run time in seconds")):
+            print(f"\n{title}; rows: share of samples missing one omic")
+            print(grouped[column].mean().unstack()[order].rename(columns=short).round(4).to_string())
+        sweep.to_csv(out / "missing_sweep.csv", index=False)
+        grouped[["r_all", "r_masked", "Run_s"]].agg(["mean", "std"]).to_csv(out / "missing_sweep_summary.csv")
+        plot_sweep(sweep, out / "missing_sweep.png")
+
+    print(f"\nTables saved to {out}/")
