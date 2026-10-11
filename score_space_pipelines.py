@@ -1,6 +1,7 @@
 """
 Score-Space Pipelines
-Four predictors of the missing omic, graded with the same Mantel test as pipeline.py.
+Five predictors of the missing omic, plus the Milestone 1 pipeline, graded with the same Mantel
+test as pipeline.py.
 
 The ground truth is Euclidean distance on the first two principal components of the
 standard-scaled microbiome + metabolome features. PCA is linear, so each sample's score
@@ -20,6 +21,14 @@ Predictors of the missing part:
 4. miss-SNF (Gliozzo et al., 2025): all three views fused over all samples at once; a sample
    missing an omic enters that omic's network through a self-loop, and message passing from
    the views it does have recovers its links there
+5. MKC+SNF: the Milestone 1 chain with its output moved into the score space. MKC completes
+   each omic's kernel, SNF fuses the two completed kernels, and the fused network's strongest
+   links average the training samples' scores
+
+The Milestone 1 pipeline itself is evaluated next to them as "MKC+SNF kernel": the same completed
+kernels and the same fusion, but the distance is read off the fused similarity (1 - similarity)
+as proposed in Milestone 1, not measured in the score space. It shares the working MKC of
+predictor 2; the version in pipeline.py is the old one, whose optimiser never moved.
 
 Two reference points sit next to them:
 - Global KNN50 (the Milestone 1 benchmark). It keeps the observed features untouched and PCA is
@@ -42,12 +51,14 @@ Experiments (all results are also written to --out as CSV, plus one figure):
 import argparse
 import itertools
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist, pdist, squareform
+from scipy.stats import ConstantInputWarning
 from sklearn.decomposition import PCA
 from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import train_test_split
@@ -58,6 +69,7 @@ from pipeline import (
     TEST_SIZE,
     apply_mask,
     full_kernel,
+    fused_to_distance,
     knn_kernel,
     load_data,
     make_mask,
@@ -170,8 +182,64 @@ class Context:
         X = self.views[view]
         return StandardScaler().fit(X.loc[self.train_ids]).transform(X.loc[rows])
 
+    def key(self):
+        """Identifies the split: its samples, its training samples and who is missing which omic."""
+        index = self.contributions["mb"].index
+        return hash((tuple(index), tuple(self.train_ids), tuple(self.missing("mb")), tuple(self.missing("mt"))))
+
+
+# Steps shared by several pipelines (an MKC fit, a fused network) are computed once per split.
+# Each entry remembers how long it took, and a pipeline that reuses it is charged that time once,
+# so reported run times are those of every pipeline run on its own.
+_CACHE = {}              # key -> (value, its own seconds, keys of the cached steps it used)
+_COMPUTING = []          # entries being computed: [seconds spent in nested entries, keys used]
+_CHARGED = set()         # entries already counted for the pipeline being timed
+_REUSED_SECONDS = [0.0]
+
+
+def _charge(key):
+    if key not in _CHARGED:
+        _CHARGED.add(key)
+        _, seconds, used = _CACHE[key]
+        _REUSED_SECONDS[0] += seconds
+        for dependency in used:
+            _charge(dependency)
+
+
+def cached(key, compute):
+    if _COMPUTING:
+        _COMPUTING[-1][1].append(key)
+    if key in _CACHE:
+        _charge(key)
+        return _CACHE[key][0]
+    _COMPUTING.append([0.0, []])
+    start = time.perf_counter()
+    value = compute()
+    elapsed = time.perf_counter() - start
+    nested, used = _COMPUTING.pop()
+    _CACHE[key] = (value, elapsed - nested, used)
+    _CHARGED.add(key)
+    if _COMPUTING:
+        _COMPUTING[-1][0] += elapsed
+    return value
+
+
+def timed(action):
+    """Result of `action` and its seconds, including the cost of every cached step it reused."""
+    _CHARGED.clear()
+    _REUSED_SECONDS[0] = 0.0
+    start = time.perf_counter()
+    result = action()
+    return result, time.perf_counter() - start + _REUSED_SECONDS[0]
+
 
 def score_space_distance(split, meta, mb_cols, mt_cols, predictor, **params):
+    """
+    Distance matrix over all samples of the split.
+
+    A predictor returns the missing score contributions per omic, and distances are then Euclidean
+    in the score space. A pipeline that defines its own distance returns the matrix directly.
+    """
     space = ScoreSpace(split.train, mb_cols, mt_cols)
     combined = split.combined
     views = {
@@ -180,7 +248,10 @@ def score_space_distance(split, meta, mb_cols, mt_cols, predictor, **params):
         "meta": meta.loc[combined.index],
     }
     ctx = Context(views, space.contributions(combined), split.train.index)
-    for omic, predicted in predictor(ctx, **params).items():
+    predictions = predictor(ctx, **params)
+    if isinstance(predictions, pd.DataFrame):
+        return predictions, ctx.diagnostics
+    for omic, predicted in predictions.items():
         ctx.contributions[omic].loc[ctx.missing(omic)] = predicted
     coords = ctx.contributions["mb"] + ctx.contributions["mt"]
     distances = pd.DataFrame(cdist(coords, coords), index=coords.index, columns=coords.index)
@@ -354,19 +425,29 @@ class MKC_embd_ht:
         return S
 
 
+MKC_VIEWS = ("mb", "mt", "meta")
+
+
+def fit_mkc(ctx, c1, c2):
+    """MKC over the two omics and metadata; one fit per split and (c1, c2), shared by every pipeline built on it."""
+    def compute():
+        index = ctx.contributions["mb"].index
+        kernels, observed = [], []
+        for view in MKC_VIEWS:
+            obs = ctx.views[view].notna().all(axis=1).to_numpy()
+            K = np.full((len(index), len(index)), np.nan)
+            K[np.ix_(obs, obs)] = rbf_kernel(ctx.standardized(view, index[obs]))
+            kernels.append(K)
+            observed.append(obs)
+        return MKC_embd_ht(c1=c1, c2=c2).fit(kernels, observed), kernels, observed
+
+    return cached(("mkc", ctx.key(), c1, c2), compute)
+
+
 def mkc_predictor(ctx, c1=1.0, c2=0.1):
     """Missing omic's contribution = its MKC reconstruction weights applied to the basis samples' contributions."""
-    views = ("mb", "mt", "meta")
-    index = ctx.contributions["mb"].index
-    kernels, observed = [], []
-    for view in views:
-        obs = ctx.views[view].notna().all(axis=1).to_numpy()
-        K = np.full((len(index), len(index)), np.nan)
-        K[np.ix_(obs, obs)] = rbf_kernel(ctx.standardized(view, index[obs]))
-        kernels.append(K)
-        observed.append(obs)
-
-    mkc = MKC_embd_ht(c1=c1, c2=c2).fit(kernels, observed)
+    views = MKC_VIEWS
+    mkc, _, observed = fit_mkc(ctx, c1, c2)
     active = [int((np.linalg.norm(mkc.A_[m][:, obs], axis=1) > 1e-8).sum()) for m, obs in enumerate(observed)]
     ctx.diagnostics["MKC view weights s_ml (rows: mb, mt, meta)"] = np.round(mkc.S_, 2).tolist()
     ctx.diagnostics["MKC active basis samples per view"] = dict(zip(views, active))
@@ -483,7 +564,11 @@ def miss_snf_predictor(ctx, K=20, k_pred=20, T=20, mu=0.5, strategy="one"):
         local_affinity(ctx.standardized(view, index[obs]), K, mu) for view, obs in zip(views, observed)
     ]
     fused = pd.DataFrame(miss_snf(affinities, observed, K=K, T=T, strategy=strategy), index=index, columns=index)
+    return strongest_link_average(ctx, fused, k_pred)
 
+
+def strongest_link_average(ctx, fused, k_pred):
+    """Missing omic's contribution = weighted mean over the sample's k_pred strongest links to training samples."""
     k_pred = min(k_pred, len(ctx.train_ids))
     predictions = {}
     for omic in OMICS:
@@ -495,7 +580,42 @@ def miss_snf_predictor(ctx, K=20, k_pred=20, T=20, mu=0.5, strategy="one"):
     return predictions
 
 # ==========================================
-# 7. TUNING & EVALUATION
+# 7. MILESTONE 1 PIPELINE: MKC COMPLETION, THEN SNF
+# ==========================================
+
+def mkc_snf_network(ctx, c1, c2, K, T=20):
+    """
+    The Milestone 1 chain: incomplete kernels -> MKC completion -> SNF fusion.
+
+    MKC completes each omic's kernel as A^T K A, which gives every sample a row in both kernels,
+    including the kernel of the omic it lacks. SNF then fuses the two completed kernels into one
+    similarity network over all samples.
+    """
+    def compute():
+        mkc, kernels, _ = fit_mkc(ctx, c1, c2)
+        completed = []
+        for m in range(len(OMICS)):
+            basis_kernel = kernels[m][np.ix_(mkc.basis_, mkc.basis_)]
+            completed.append(mkc.A_[m].T @ basis_kernel @ mkc.A_[m])
+        return snf(completed, K=K, T=T, minmax=True)
+
+    return cached(("mkc-snf", ctx.key(), c1, c2, K, T), compute)
+
+
+def mkc_snf_kernel_distance(ctx, c1=1.0, c2=0.1, K=20):
+    """Milestone 1 pipeline as proposed: the distance is 1 - fused similarity, not a score-space distance."""
+    index = ctx.contributions["mb"].index
+    return pd.DataFrame(fused_to_distance(mkc_snf_network(ctx, c1, c2, K)), index=index, columns=index)
+
+
+def mkc_snf_predictor(ctx, c1=1.0, c2=0.1, K=20, k_pred=20):
+    """Same fused network, used to predict the missing omic's contribution from the strongest links."""
+    index = ctx.contributions["mb"].index
+    fused = pd.DataFrame(mkc_snf_network(ctx, c1, c2, K), index=index, columns=index)
+    return strongest_link_average(ctx, fused, k_pred)
+
+# ==========================================
+# 8. TUNING & EVALUATION
 # ==========================================
 
 def grid(**axes):
@@ -510,6 +630,14 @@ METHODS = {
     "miss-SNF (score space)": (
         miss_snf_predictor,
         grid(strategy=["one", "equidistant"], K=[10, 20, 40], k_pred=[10, 30, 60]),
+    ),
+    "MKC+SNF (score space)": (
+        mkc_snf_predictor,
+        grid(c1=[0.1, 10.0], c2=[0.01, 1.0, 10.0], K=[10, 20, 40], k_pred=[10, 30, 60]),
+    ),
+    "MKC+SNF kernel (Milestone 1 pipeline)": (
+        mkc_snf_kernel_distance,
+        grid(c1=[0.1, 10.0], c2=[0.01, 1.0, 10.0], K=[10, 20, 40]),
     ),
 }
 
@@ -529,11 +657,14 @@ def tune(predictor, param_grid, train, meta, mb_cols, mt_cols):
     if len(param_grid) == 1:
         return param_grid[0]
     inner = make_split(train, mb_cols, mt_cols, 0.25, RANDOM_STATE, RANDOM_STATE)
-    scores = [
-        evaluate(inner, score_space_distance(inner, meta, mb_cols, mt_cols, predictor, **params)[0], 0)[0]
-        for params in param_grid
-    ]
-    return param_grid[int(np.argmax(scores))]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConstantInputWarning)
+        scores = [
+            evaluate(inner, score_space_distance(inner, meta, mb_cols, mt_cols, predictor, **params)[0], 0)[0]
+            for params in param_grid
+        ]
+    # A degenerate setting (all distances equal) has no Mantel r; it must never be selected.
+    return param_grid[int(np.argmax(np.nan_to_num(scores, nan=-np.inf)))]
 
 
 def run_all(split, meta, mb_cols, mt_cols, fixed_params=None):
@@ -544,6 +675,7 @@ def run_all(split, meta, mb_cols, mt_cols, fixed_params=None):
     distance matrix. Neither includes the Mantel test, so the timings compare the pipelines only.
     With fixed_params (name -> parameters) tuning is skipped.
     """
+    _CACHE.clear()
     start = time.perf_counter()
     reconstructed = reconstruct_knn(split.combined, split.train.index, n_neighbors=50)
     distances = pca_distance(split.train, reconstructed)
@@ -551,15 +683,15 @@ def run_all(split, meta, mb_cols, mt_cols, fixed_params=None):
              "Tune_s": 0.0, "Run_s": time.perf_counter() - start}]
 
     for name, (predictor, param_grid) in METHODS.items():
-        start = time.perf_counter()
         if fixed_params is None:
-            params = tune(predictor, param_grid, split.train, meta, mb_cols, mt_cols)
+            params, tune_s = timed(lambda: tune(predictor, param_grid, split.train, meta, mb_cols, mt_cols))
         else:
-            params = fixed_params[name]
-        tuned = time.perf_counter()
-        distances, diagnostics = score_space_distance(split, meta, mb_cols, mt_cols, predictor, **params)
+            params, tune_s = fixed_params[name], 0.0
+        (distances, diagnostics), run_s = timed(
+            lambda: score_space_distance(split, meta, mb_cols, mt_cols, predictor, **params)
+        )
         runs.append({"Pipeline": name, "distances": distances, "params": params, "diagnostics": diagnostics,
-                     "Tune_s": tuned - start, "Run_s": time.perf_counter() - tuned})
+                     "Tune_s": tune_s, "Run_s": run_s})
     return runs
 
 
@@ -576,7 +708,7 @@ def compare_on_split(split, meta, mb_cols, mt_cols, n_permutations):
     return pd.DataFrame(rows), diagnostics, chosen
 
 # ==========================================
-# 8. MISSING-PERCENTAGE SWEEP
+# 9. MISSING-PERCENTAGE SWEEP
 # ==========================================
 
 def missing_sweep(complete, meta, mb_cols, mt_cols, fractions, n_seeds, fixed_params):
@@ -645,16 +777,25 @@ def parse_args():
     parser.add_argument("--sweep-retune", action="store_true",
                         help="tune inside every sweep split instead of reusing the main split's parameters (much slower)")
     parser.add_argument("--out", default="results", help="folder for the CSV tables and the figure")
+    parser.add_argument("--methods", default="",
+                        help="comma-separated parts of pipeline names to run, e.g. \"MKC+SNF,Ridge\" "
+                             "(default: all; the KNN50 benchmark always runs)")
     return parser.parse_args()
 
 # ==========================================
-# 9. EXECUTION
+# 10. EXECUTION
 # ==========================================
 
 if __name__ == "__main__":
     args = parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    wanted = [part.strip().lower() for part in args.methods.split(",") if part.strip()]
+    if wanted:
+        METHODS = {name: method for name, method in METHODS.items() if any(part in name.lower() for part in wanted)}
+        if not METHODS:
+            raise SystemExit("--methods matched no pipeline")
+        print("Pipelines: " + ", ".join([BENCHMARK, *METHODS]))
     order = [BENCHMARK, *METHODS]
     data, complete, mb_cols, mt_cols, metadata = load_data("microbiome.csv", "metabolome.csv", "metadata.csv")
     meta = metadata_features(metadata)
