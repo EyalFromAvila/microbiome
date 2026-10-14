@@ -38,6 +38,23 @@ Two reference points sit next to them:
 - Mean fill: the missing part is set to the training mean. This is the floor, the score of a
   pipeline that learns nothing about the missing omic.
 
+Target space (--space), what the predictors predict for the missing omic:
+- score (default): its two PC contributions, as above.
+- features: no PCA in the prediction. The predictors predict the missing omic's whole block of
+  standard-scaled features (scaler fitted on the complete training samples, the grader's scaling),
+  which is how KNN50 imputes it. The completed feature vectors are then measured the way the
+  grader measures them: projected onto the first two PCs of the complete training samples (the
+  same PCA as the score space and the KNN50 benchmark), Euclidean distance there.
+  The distance must stay a 2-PC distance because the ground truth is one. A distance over all
+  features scores low even for a perfect imputation, because the first two PCs carry only a small
+  part of the variance and the rest, which the ground truth ignores, dominates such a distance
+  (check_feature_space.py measures this on the data).
+  Every predictor except Ridge outputs a fixed weighted average of training rows and the projection
+  is linear, so with the same parameters their distances are identical to the score-space ones:
+  predicting the two scores directly is a shortcut, not a source of accuracy. Ridge picks one alpha
+  for all its targets (2 scores or every feature), so it can differ. The Milestone 1 kernel pipeline
+  reads its distance off the fused similarity, so it is the same in both spaces.
+
 Experiments (all results are also written to --out as CSV, plus one figure):
 - Main split: same split and masks as pipeline.py, with Mantel r, p-value, tuning time and
   prediction time for every pipeline.
@@ -145,14 +162,17 @@ def metadata_features(metadata):
     return features.loc[:, ~features.T.duplicated()]
 
 # ==========================================
-# 2. SCORE SPACE (SHARED BY ALL PREDICTORS)
+# 2. TARGET SPACES (SHARED BY ALL PREDICTORS)
 # ==========================================
 
 class ScoreSpace:
     """Ground-truth PCA fitted on complete training samples, split into per-omic contributions."""
 
+    name = "score space"
+
     def __init__(self, train, mb_cols, mt_cols):
         self.columns = {"mb": mb_cols, "mt": mt_cols}
+        self.features = list(train.columns)
         self.scaler = StandardScaler().fit(train)
         self.pca = PCA(n_components=2, random_state=RANDOM_STATE).fit(self.scaler.transform(train))
         self.loadings = pd.DataFrame(self.pca.components_, columns=train.columns)
@@ -165,10 +185,48 @@ class ScoreSpace:
             for omic, cols in self.columns.items()
         }
 
+    def combine(self, contributions):
+        """Coordinates the distance is measured in, the first two PCs: the two omics' contributions add up."""
+        return contributions["mb"] + contributions["mt"]
+
+
+class FeatureSpace(ScoreSpace):
+    """
+    No PCA in the prediction: each omic's part is its own block of standard-scaled features.
+
+    The scaler and the PCA are the score space's, both fitted on the complete training samples.
+    The PCA is used only at the end, to measure the completed feature vectors the way the grader
+    does, on the first two PCs; measuring over all features would not match the ground truth.
+    """
+
+    name = "feature space"
+
+    def contributions(self, data):
+        """Each omic's scaled features; rows where that omic is missing come out as NaN."""
+        z = (data - self.scaler.mean_) / self.scaler.scale_
+        return {omic: z[cols].copy() for omic, cols in self.columns.items()}
+
+    def combine(self, contributions):
+        """Completed scaled features of both omics, projected onto the first two PCs."""
+        z = pd.concat([contributions["mb"], contributions["mt"]], axis=1)[self.features]
+        return pd.DataFrame(self.pca.transform(z.to_numpy()), index=z.index)
+
+
+SPACES = {"score": ScoreSpace, "features": FeatureSpace}
+
+
+def distance_matrix(coords):
+    return pd.DataFrame(cdist(coords, coords), index=coords.index, columns=coords.index)
+
 
 @dataclass
 class Context:
-    """What a predictor may use: omic and metadata inputs plus the known score contributions."""
+    """
+    What a predictor may use: omic and metadata inputs plus the known parts of the target space.
+
+    contributions[omic] holds that omic's part of every sample (two PC contributions, or its scaled
+    features in the feature space), NaN where the omic is missing; predictors fill those rows.
+    """
     views: dict
     contributions: dict
     train_ids: pd.Index
@@ -233,33 +291,33 @@ def timed(action):
     return result, time.perf_counter() - start + _REUSED_SECONDS[0]
 
 
-def score_space_distance(split, meta, mb_cols, mt_cols, predictor, **params):
+def pipeline_distance(split, meta, mb_cols, mt_cols, predictor, space="score", **params):
     """
     Distance matrix over all samples of the split.
 
-    A predictor returns the missing score contributions per omic, and distances are then Euclidean
-    in the score space. A pipeline that defines its own distance returns the matrix directly.
+    A predictor returns each omic's missing part in the target space (two PC contributions, or the
+    full block of scaled features), and distances are then Euclidean on the first two PCs, the
+    ground truth's geometry, in both spaces. A pipeline that defines its own distance returns the
+    matrix directly.
     """
-    space = ScoreSpace(split.train, mb_cols, mt_cols)
+    target = SPACES[space](split.train, mb_cols, mt_cols)
     combined = split.combined
     views = {
         "mb": omic_features(combined[mb_cols], "mb"),
         "mt": omic_features(combined[mt_cols], "mt"),
         "meta": meta.loc[combined.index],
     }
-    ctx = Context(views, space.contributions(combined), split.train.index)
+    ctx = Context(views, target.contributions(combined), split.train.index)
     predictions = predictor(ctx, **params)
     if isinstance(predictions, pd.DataFrame):
         return predictions, ctx.diagnostics
     for omic, predicted in predictions.items():
         ctx.contributions[omic].loc[ctx.missing(omic)] = predicted
-    coords = ctx.contributions["mb"] + ctx.contributions["mt"]
-    distances = pd.DataFrame(cdist(coords, coords), index=coords.index, columns=coords.index)
-    return distances, ctx.diagnostics
+    return distance_matrix(target.combine(ctx.contributions)), ctx.diagnostics
 
 
 def mean_predictor(ctx):
-    """Floor: the missing omic's contribution is its training mean (what mean imputation of that omic gives)."""
+    """Floor: the missing omic's part is its training mean (what mean imputation of that omic gives)."""
     return {
         omic: np.tile(ctx.contributions[omic].loc[ctx.train_ids].mean().to_numpy(), (len(ctx.missing(omic)), 1))
         for omic in OMICS
@@ -622,16 +680,17 @@ def grid(**axes):
     return [dict(zip(axes, values)) for values in itertools.product(*axes.values())]
 
 
+# "{space}" in a name is filled with the target space when the pipeline runs (see label).
 METHODS = {
-    "Mean fill (score space floor)": (mean_predictor, [{}]),
-    "Ridge (score space)": (ridge_predictor, [{}]),
-    "MKC_embd(ht) (score space)": (mkc_predictor, grid(c1=[0.1, 10.0], c2=[0.01, 1.0, 10.0])),
-    "SNF neighbours (score space)": (snf_predictor, grid(K=[10, 20, 40], k_pred=[10, 30, 60])),
-    "miss-SNF (score space)": (
+    "Mean fill ({space} floor)": (mean_predictor, [{}]),
+    "Ridge ({space})": (ridge_predictor, [{}]),
+    "MKC_embd(ht) ({space})": (mkc_predictor, grid(c1=[0.1, 10.0], c2=[0.01, 1.0, 10.0])),
+    "SNF neighbours ({space})": (snf_predictor, grid(K=[10, 20, 40], k_pred=[10, 30, 60])),
+    "miss-SNF ({space})": (
         miss_snf_predictor,
         grid(strategy=["one", "equidistant"], K=[10, 20, 40], k_pred=[10, 30, 60]),
     ),
-    "MKC+SNF (score space)": (
+    "MKC+SNF ({space})": (
         mkc_snf_predictor,
         grid(c1=[0.1, 10.0], c2=[0.01, 1.0, 10.0], K=[10, 20, 40], k_pred=[10, 30, 60]),
     ),
@@ -640,6 +699,11 @@ METHODS = {
         grid(c1=[0.1, 10.0], c2=[0.01, 1.0, 10.0], K=[10, 20, 40]),
     ),
 }
+
+
+def label(name, space):
+    """Pipeline name as reported, e.g. "Ridge (score space)" or "Ridge (feature space)"."""
+    return name.format(space=SPACES[space].name)
 
 
 def short(name):
@@ -652,7 +716,7 @@ def evaluate(split, distances, n_permutations, ids=None):
     return mantel_test(split.ground_truth.loc[ids, ids], distances.loc[ids, ids], n_permutations=n_permutations)
 
 
-def tune(predictor, param_grid, train, meta, mb_cols, mt_cols):
+def tune(predictor, param_grid, train, meta, mb_cols, mt_cols, space="score"):
     """Pick parameters on an inner masked split of the training samples only (same protocol as pipeline.py)."""
     if len(param_grid) == 1:
         return param_grid[0]
@@ -660,45 +724,48 @@ def tune(predictor, param_grid, train, meta, mb_cols, mt_cols):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ConstantInputWarning)
         scores = [
-            evaluate(inner, score_space_distance(inner, meta, mb_cols, mt_cols, predictor, **params)[0], 0)[0]
+            evaluate(inner, pipeline_distance(inner, meta, mb_cols, mt_cols, predictor, space, **params)[0], 0)[0]
             for params in param_grid
         ]
     # A degenerate setting (all distances equal) has no Mantel r; it must never be selected.
     return param_grid[int(np.argmax(np.nan_to_num(scores, nan=-np.inf)))]
 
 
-def run_all(split, meta, mb_cols, mt_cols, fixed_params=None):
+def run_all(split, meta, mb_cols, mt_cols, space="score", fixed_params=None):
     """
     Distance matrices over all samples of the split, from the benchmark and from every method.
 
+    Every pipeline, the KNN50 benchmark included, measures its distances on the first two PCs.
     Tune_s is the time spent choosing parameters and Run_s the time from the masked data to the
     distance matrix. Neither includes the Mantel test, so the timings compare the pipelines only.
-    With fixed_params (name -> parameters) tuning is skipped.
+    With fixed_params (pipeline label -> parameters) tuning is skipped.
     """
     _CACHE.clear()
     start = time.perf_counter()
     reconstructed = reconstruct_knn(split.combined, split.train.index, n_neighbors=50)
-    distances = pca_distance(split.train, reconstructed)
+    target = SPACES[space](split.train, mb_cols, mt_cols)
+    distances = distance_matrix(target.combine(target.contributions(reconstructed)))
     runs = [{"Pipeline": BENCHMARK, "distances": distances, "params": {}, "diagnostics": {},
              "Tune_s": 0.0, "Run_s": time.perf_counter() - start}]
 
     for name, (predictor, param_grid) in METHODS.items():
+        pipeline = label(name, space)
         if fixed_params is None:
-            params, tune_s = timed(lambda: tune(predictor, param_grid, split.train, meta, mb_cols, mt_cols))
+            params, tune_s = timed(lambda: tune(predictor, param_grid, split.train, meta, mb_cols, mt_cols, space))
         else:
-            params, tune_s = fixed_params[name], 0.0
+            params, tune_s = fixed_params[pipeline], 0.0
         (distances, diagnostics), run_s = timed(
-            lambda: score_space_distance(split, meta, mb_cols, mt_cols, predictor, **params)
+            lambda: pipeline_distance(split, meta, mb_cols, mt_cols, predictor, space, **params)
         )
-        runs.append({"Pipeline": name, "distances": distances, "params": params, "diagnostics": diagnostics,
+        runs.append({"Pipeline": pipeline, "distances": distances, "params": params, "diagnostics": diagnostics,
                      "Tune_s": tune_s, "Run_s": run_s})
     return runs
 
 
-def compare_on_split(split, meta, mb_cols, mt_cols, n_permutations):
+def compare_on_split(split, meta, mb_cols, mt_cols, n_permutations, space="score"):
     """Score every pipeline on the samples missing an omic; returns the table, diagnostics and chosen parameters."""
     rows, diagnostics, chosen = [], {}, {}
-    for run in run_all(split, meta, mb_cols, mt_cols):
+    for run in run_all(split, meta, mb_cols, mt_cols, space):
         r, p = evaluate(split, run["distances"], n_permutations)
         rows.append({"Pipeline": run["Pipeline"], "Mantel_r": r, "P_Value": p, "Params": run["params"] or "-",
                      "Tune_s": run["Tune_s"], "Run_s": run["Run_s"]})
@@ -711,7 +778,7 @@ def compare_on_split(split, meta, mb_cols, mt_cols, n_permutations):
 # 9. MISSING-PERCENTAGE SWEEP
 # ==========================================
 
-def missing_sweep(complete, meta, mb_cols, mt_cols, fractions, n_seeds, fixed_params):
+def missing_sweep(complete, meta, mb_cols, mt_cols, fractions, n_seeds, fixed_params, space="score"):
     """
     Mantel r of every pipeline as the share of samples missing an omic grows.
 
@@ -724,7 +791,7 @@ def missing_sweep(complete, meta, mb_cols, mt_cols, fractions, n_seeds, fixed_pa
         for seed in range(n_seeds):
             split = make_missing_split(complete, mb_cols, mt_cols, fraction, seed)
             everyone = split.combined.index
-            for run in run_all(split, meta, mb_cols, mt_cols, fixed_params):
+            for run in run_all(split, meta, mb_cols, mt_cols, space, fixed_params):
                 rows.append({
                     "Missing_fraction": fraction,
                     "Seed": seed,
@@ -740,7 +807,7 @@ def missing_sweep(complete, meta, mb_cols, mt_cols, fractions, n_seeds, fixed_pa
     return pd.DataFrame(rows)
 
 
-def plot_sweep(sweep, path):
+def plot_sweep(sweep, path, space="score"):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -761,6 +828,7 @@ def plot_sweep(sweep, path):
         ax.set_ylabel("Mantel r vs ground truth")
         ax.grid(alpha=0.3)
     axes[1].legend(fontsize=8)
+    fig.suptitle(f"Missing omic predicted in the {SPACES[space].name}; distances on the first two PCs")
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
@@ -768,7 +836,11 @@ def plot_sweep(sweep, path):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Compare score-space predictors against the KNN50 benchmark.")
+    parser = argparse.ArgumentParser(description="Compare predictors of the missing omic against the KNN50 benchmark.")
+    parser.add_argument("--space", choices=sorted(SPACES), default="score",
+                        help="what is predicted for the missing omic: 'score' (its two PC contributions) or "
+                             "'features' (all its standard-scaled features, no PCA in the prediction). "
+                             "Distances are measured on the first two PCs in both, like the ground truth")
     parser.add_argument("--splits", type=int, default=10, help="extra random splits for the paired comparison (0 skips)")
     parser.add_argument("--permutations", type=int, default=999, help="Mantel permutations on the main split")
     parser.add_argument("--sweep-seeds", type=int, default=3, help="repeats per missing fraction in the sweep (0 skips)")
@@ -776,7 +848,9 @@ def parse_args():
                         help="comma-separated shares of all samples that lose one omic in the sweep")
     parser.add_argument("--sweep-retune", action="store_true",
                         help="tune inside every sweep split instead of reusing the main split's parameters (much slower)")
-    parser.add_argument("--out", default="results", help="folder for the CSV tables and the figure")
+    parser.add_argument("--out", default=None,
+                        help="folder for the CSV tables and the figure (default: results, or results_features "
+                             "with --space features)")
     parser.add_argument("--methods", default="",
                         help="comma-separated parts of pipeline names to run, e.g. \"MKC+SNF,Ridge\" "
                              "(default: all; the KNN50 benchmark always runs)")
@@ -788,25 +862,28 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    out = Path(args.out)
+    space = args.space
+    out = Path(args.out or ("results" if space == "score" else f"results_{space}"))
     out.mkdir(parents=True, exist_ok=True)
     wanted = [part.strip().lower() for part in args.methods.split(",") if part.strip()]
     if wanted:
         METHODS = {name: method for name, method in METHODS.items() if any(part in name.lower() for part in wanted)}
         if not METHODS:
             raise SystemExit("--methods matched no pipeline")
-        print("Pipelines: " + ", ".join([BENCHMARK, *METHODS]))
-    order = [BENCHMARK, *METHODS]
+    order = [BENCHMARK, *(label(name, space) for name in METHODS)]
+    print(f"Target space: {SPACES[space].name}")
+    if wanted:
+        print("Pipelines: " + ", ".join(order))
     data, complete, mb_cols, mt_cols, metadata = load_data("microbiome.csv", "metabolome.csv", "metadata.csv")
     meta = metadata_features(metadata)
     pd.set_option("display.width", 200)
     pd.set_option("display.max_colwidth", 60)
 
     print("\n" + "=" * 60)
-    print("MAIN SPLIT (same train/test split and masks as pipeline.py)")
+    print(f"MAIN SPLIT (same train/test split and masks as pipeline.py; {SPACES[space].name})")
     print("=" * 60)
     main_split = make_split(complete, mb_cols, mt_cols, TEST_SIZE, RANDOM_STATE, RANDOM_STATE + 10_000)
-    results, diagnostics, main_params = compare_on_split(main_split, meta, mb_cols, mt_cols, args.permutations)
+    results, diagnostics, main_params = compare_on_split(main_split, meta, mb_cols, mt_cols, args.permutations, space)
     print(results.round(4).to_string(index=False))
     print("(Tune_s: choosing parameters. Run_s: masked data to distance matrix. Seconds, Mantel test excluded.)")
     for name, info in diagnostics.items():
@@ -816,12 +893,12 @@ if __name__ == "__main__":
 
     if args.splits:
         print("\n" + "=" * 60)
-        print(f"PAIRED COMPARISON OVER {args.splits} RANDOM SPLITS (tuned inside each split)")
+        print(f"PAIRED COMPARISON OVER {args.splits} RANDOM SPLITS (tuned inside each split; {SPACES[space].name})")
         print("=" * 60)
         per_split = []
         for seed in range(args.splits):
             split = make_split(complete, mb_cols, mt_cols, TEST_SIZE, seed, seed + 10_000)
-            split_results, _, _ = compare_on_split(split, meta, mb_cols, mt_cols, n_permutations=0)
+            split_results, _, _ = compare_on_split(split, meta, mb_cols, mt_cols, n_permutations=0, space=space)
             per_split.append(split_results.drop(columns="P_Value").assign(Split=seed))
             print(f"split {seed}: " + "  ".join(
                 f"{short(name)}={r:.3f}" for name, r in zip(split_results["Pipeline"], split_results["Mantel_r"])
@@ -850,10 +927,11 @@ if __name__ == "__main__":
             raise SystemExit("--fractions must lie strictly between 0 and 1")
         print("\n" + "=" * 60)
         print(f"MISSING-PERCENTAGE SWEEP ({args.sweep_seeds} repeats per percentage, "
-              + ("tuned inside each split)" if args.sweep_retune else "main-split parameters)"))
+              + ("tuned inside each split" if args.sweep_retune else "main-split parameters")
+              + f"; {SPACES[space].name})")
         print("=" * 60)
         sweep = missing_sweep(complete, meta, mb_cols, mt_cols, fractions, args.sweep_seeds,
-                              None if args.sweep_retune else main_params)
+                              None if args.sweep_retune else main_params, space)
         grouped = sweep.groupby(["Missing_fraction", "Pipeline"])
         for column, title in (("r_all", "Mean Mantel r over ALL samples (as graded)"),
                               ("r_masked", "Mean Mantel r over samples missing an omic only"),
@@ -862,6 +940,6 @@ if __name__ == "__main__":
             print(grouped[column].mean().unstack()[order].rename(columns=short).round(4).to_string())
         sweep.to_csv(out / "missing_sweep.csv", index=False)
         grouped[["r_all", "r_masked", "Run_s"]].agg(["mean", "std"]).to_csv(out / "missing_sweep_summary.csv")
-        plot_sweep(sweep, out / "missing_sweep.png")
+        plot_sweep(sweep, out / "missing_sweep.png", space)
 
     print(f"\nTables saved to {out}/")
