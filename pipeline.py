@@ -11,7 +11,7 @@ Compares 4 Pipeline Strategies using Mantel Test Correlation (Mantel r)
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist, pdist, squareform
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, spearmanr
 from sklearn.decomposition import PCA
 from sklearn.impute import KNNImputer
 from sklearn.model_selection import train_test_split
@@ -71,7 +71,11 @@ def pca_distance(train, evaluation):
         columns=evaluation.index,
     )
 
-def mantel_test(matrix1, matrix2, n_permutations=999, random_state=RANDOM_STATE):
+MANTEL_CORRELATIONS = {"pearson": pearsonr, "spearman": spearmanr}
+
+def mantel_test(matrix1, matrix2, n_permutations=999, random_state=RANDOM_STATE, method="pearson"):
+    """Mantel r between two distance matrices (method: "pearson" or "spearman") and its one-sided permutation p-value."""
+    correlation = MANTEL_CORRELATIONS[method]
     matrix2 = matrix2.loc[matrix1.index, matrix1.columns]
     i, j = np.triu_indices(len(matrix1), k=1)
     v1 = matrix1.to_numpy()[i, j]
@@ -80,7 +84,7 @@ def mantel_test(matrix1, matrix2, n_permutations=999, random_state=RANDOM_STATE)
     if len(v1) == 0:
         return 0.0, 1.0
         
-    r, _ = pearsonr(v1, v2)
+    r, _ = correlation(v1, v2)
     if n_permutations == 0:
         return float(r), np.nan
 
@@ -90,7 +94,7 @@ def mantel_test(matrix1, matrix2, n_permutations=999, random_state=RANDOM_STATE)
     for _ in range(n_permutations):
         perm = rng.permutation(len(m2))
         permuted = m2[np.ix_(perm, perm)]
-        r_perm, _ = pearsonr(v1, permuted[i, j])
+        r_perm, _ = correlation(v1, permuted[i, j])
         count += r_perm >= r
 
     return float(r), (count + 1) / (n_permutations + 1)
