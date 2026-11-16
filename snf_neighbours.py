@@ -369,6 +369,7 @@ def parse_args():
                         help="tune inside every sweep split instead of reusing the main split's parameters (slower)")
     parser.add_argument("--tune-metric", choices=METRICS, default="spearman",
                         help="Mantel correlation that the parameter tuning maximises (both are always reported)")
+    parser.add_argument("--data-dir", default=".", help="folder containing microbiome.csv, metabolome.csv, metadata.csv")
     parser.add_argument("--out", default="results", help="folder for the CSV tables and the figure")
     return parser.parse_args()
 
@@ -381,7 +382,10 @@ if __name__ == "__main__":
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     order = [BENCHMARK, PIPELINE]
-    data, complete, mb_cols, mt_cols, metadata = load_data("microbiome.csv", "metabolome.csv", "metadata.csv")
+    data_dir = Path(args.data_dir)
+    data, complete, mb_cols, mt_cols, metadata = load_data(
+        data_dir / "microbiome.csv", data_dir / "metabolome.csv", data_dir / "metadata.csv"
+    )
     meta = metadata_features(metadata)
     pd.set_option("display.width", 200)
     pd.set_option("display.max_colwidth", 60)
