@@ -4,24 +4,45 @@ SNF Neighbours: the final pipeline (Milestone 3)
 Estimates an n x n distance matrix between samples from microbiome + metabolome data when one
 omic is missing for some samples, graded with the same Mantel test as pipeline.py.
 
-For each omic, the samples missing it are filled in as follows:
-1. Inputs: the observed omic (log-transformed; CLR for the compositional microbiome) and the
-   metadata, each standard-scaled on the complete training samples.
-2. One scaled exponential affinity network per input (Wang et al., 2014), built over the complete
-   training samples and the samples missing this omic.
-3. SNF fuses the two networks into one similarity network.
-4. A sample's missing omic is the weighted mean of the standard-scaled features of its k_pred most
-   strongly linked training samples, weighted by the fused similarity.
+The grader standardizes every microbiome and metabolome feature, runs PCA and measures Euclidean
+distances on the first two PCs. Because PCA is a linear projection, a sample's two PC scores are
+exactly the sum of a microbiome part and a metabolome part ("score space"):
 
-The observed omic keeps its own standard-scaled features (scaler fitted on the complete training
-samples), and the distance is Euclidean over all features of both omics. The pipeline itself uses
-no PCA: PCA appears only in the grader's ground truth (first two PCs of the standard-scaled data),
-which the Mantel test and the parameter tuning compare against.
+    score = z_mb @ L_mb.T + z_mt @ L_mt.T       (z: standard-scaled features, L: PCA loadings)
+
+So the pipeline:
+1. Fits the scaler and a 2-PC PCA on the complete samples and splits the loadings by omic.
+2. Computes the observed omic's part of the scores exactly.
+3. Predicts only the missing omic's part (two numbers per sample) with SNF neighbours:
+   a. Inputs: the observed omic (log-transformed; CLR for the compositional microbiome) and the
+      metadata, each standard-scaled on the complete training samples.
+   b. One scaled exponential affinity network per input (Wang et al., 2014), built over the
+      complete training samples and the samples missing this omic.
+   c. SNF fuses the two networks into one similarity network.
+   d. The missing part is the weighted mean of the parts of the sample's k_pred most strongly
+      linked training samples, weighted by the fused similarity.
+4. Measures Euclidean distances on the completed 2-D scores, the grader's geometry.
 
 Reference point: Global KNN50 (the Milestone 1 benchmark) fills in the missing omic with a
-50-neighbour average and is measured in the same feature space.
+50-neighbour average; its completed data are measured in the same 2-PC score space.
 
-Every result is reported with both a Pearson and a Spearman Mantel r, so it can be compared with
+Usage (one script for the submission and the experiments):
+
+  python snf_neighbours.py                 # submission: n x n distance matrix per cohort
+  python snf_neighbours.py experiments     # evaluation against KNN50 on simulated missingness
+
+Submission mode runs the pipeline on every sample of each cohort with its real missingness
+(`predict_full_cohort`), with K and k_pred tuned on an inner masked split of the complete samples.
+Default cohorts (run prepare_validation_datasets.py first for the two validation cohorts):
+  metacardis  ./{microbiome,metabolome,metadata}.csv
+  franzosa    prepared_datasets/franzosa/
+  yachida     prepared_datasets/yachida/
+It writes student_res_<cohort>.csv (sample IDs as row and column labels) and
+submission_params.csv (chosen parameters per cohort) to --submission-dir, after checking that
+every input sample is in the matrix exactly once and that the matrix is a valid distance matrix.
+Use --cohort NAME=FOLDER (repeatable) for other folders, --K/--k-pred to fix the parameters.
+
+Experiments mode simulates missingness instead. Every result is reported with both a Pearson and a Spearman Mantel r, so it can be compared with
 earlier (Pearson) results. Parameters are tuned on one of them (--tune-metric, default Spearman).
 
 Experiments (all results are also written to --out as CSV, plus one figure):
@@ -45,6 +66,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist, pdist, squareform
 from scipy.stats import ConstantInputWarning
+from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
@@ -67,6 +89,8 @@ PIPELINE = "SNF neighbours"
 BENCHMARK = "Global KNN50 (Benchmark)"
 METRICS = ("pearson", "spearman")
 PARAM_GRID = [{"K": K, "k_pred": k_pred} for K, k_pred in itertools.product([10, 20, 40], [10, 30, 60])]
+CATEGORICAL_META = ("PATGROUPFINAL_C", "CENTER_C")
+NUMERIC_META = ("GENDER", "BMI_C", "AGE")
 
 # ==========================================
 # 1. SPLITS & INPUT FEATURES
@@ -111,42 +135,70 @@ def make_missing_split(complete, mb_cols, mt_cols, missing_fraction, seed):
 
 
 def omic_features(block, omic):
-    """Log-ratio inputs for the affinity networks (CLR for the compositional microbiome)."""
-    logged = np.log(block + PSEUDOCOUNT)
+    """
+    Log-ratio inputs for the affinity networks (CLR for the compositional microbiome).
+
+    Data with negative values are taken to be already transformed (e.g. CLR or log) and are used
+    as they are. Otherwise zeros get a pseudocount before the log: 1e-6 for the microbiome
+    (relative abundances), and half the smallest positive value for the metabolome, whose scale
+    depends on the platform, so a fixed tiny pseudocount would turn zeros into extreme outliers.
+    """
+    values = block.to_numpy(dtype=float)
+    if np.nanmin(values) < 0:
+        return block
+    pseudocount = PSEUDOCOUNT
+    if omic == "mt" and (values == 0).any():
+        pseudocount = 0.5 * values[values > 0].min()
+    logged = np.log(block + pseudocount)
     if omic == "mb":
         return logged.sub(logged.mean(axis=1), axis=0)
     return logged
 
 
 def metadata_features(metadata):
-    categorical = pd.get_dummies(metadata[["PATGROUPFINAL_C", "CENTER_C"]].astype(str)).astype(float)
-    numeric = metadata[["GENDER", "BMI_C", "AGE"]]
-    features = pd.concat(
-        [categorical, numeric.fillna(numeric.median()), numeric.isna().astype(float).add_suffix("_missing")],
-        axis=1,
-    )
+    """
+    Patient group and centre as one-hot columns; gender, BMI and age as numbers (median-filled)
+    plus a missing flag each. Columns a cohort does not have are skipped.
+    """
+    parts = []
+    categorical = [column for column in CATEGORICAL_META if column in metadata.columns]
+    if categorical:
+        parts.append(pd.get_dummies(metadata[categorical].astype(str)).astype(float))
+    numeric = [column for column in NUMERIC_META if column in metadata.columns]
+    if numeric:
+        values = metadata[numeric].apply(pd.to_numeric, errors="coerce")
+        parts += [values.fillna(values.median()).fillna(0.0), values.isna().astype(float).add_suffix("_missing")]
+    if not parts:
+        return pd.DataFrame({"const": np.ones(len(metadata))}, index=metadata.index)
+    features = pd.concat(parts, axis=1)
     return features.loc[:, ~features.T.duplicated()]
 
 # ==========================================
-# 2. FEATURE SPACE (WHERE DISTANCES ARE MEASURED)
+# 2. SCORE SPACE (WHERE DISTANCES ARE MEASURED)
 # ==========================================
 
-class FeatureSpace:
-    """Each omic is its own block of standard-scaled features (scaler fitted on the complete training samples)."""
+class ScoreSpace:
+    """The grader's geometry: scaler and 2-PC PCA fitted on the complete training samples, split by omic."""
 
     def __init__(self, train, mb_cols, mt_cols):
         self.columns = {"mb": mb_cols, "mt": mt_cols}
+        self.features = list(train.columns)
         self.scaler = StandardScaler().fit(train)
+        self.pca = PCA(n_components=2, random_state=RANDOM_STATE).fit(self.scaler.transform(train))
+        self.loadings = pd.DataFrame(self.pca.components_, columns=train.columns)
 
-    def blocks(self, data):
-        """Each omic's scaled features; rows where that omic is missing come out as NaN."""
-        z = (data - self.scaler.mean_) / self.scaler.scale_
-        return {omic: z[cols].copy() for omic, cols in self.columns.items()}
+    def contributions(self, data):
+        """Each omic's part of the two PC scores; rows where that omic is missing come out as NaN."""
+        z = (data[self.features] - self.scaler.mean_) / self.scaler.scale_ - self.pca.mean_
+        return {
+            omic: pd.DataFrame(z[cols].to_numpy() @ self.loadings[cols].to_numpy().T, index=data.index)
+            for omic, cols in self.columns.items()
+        }
 
     @staticmethod
-    def combine(blocks):
-        """Full feature vector: the two omics' blocks side by side."""
-        return pd.concat([blocks["mb"], blocks["mt"]], axis=1)
+    def combine(contributions):
+        """The first two PC scores: the two omics' parts add up."""
+        return contributions["mb"] + contributions["mt"]
 
 
 def distance_matrix(coords):
@@ -156,18 +208,23 @@ def distance_matrix(coords):
 @dataclass
 class Context:
     """
-    What the predictor may use: omic and metadata inputs plus the known scaled features.
+    What the predictor may use: omic and metadata inputs plus the known parts of the scores.
 
-    targets[omic] holds that omic's scaled features for every sample, NaN where the omic is
+    contributions[omic] holds that omic's part of every sample's scores, NaN where the omic is
     missing; the predictor fills those rows.
     """
     views: dict
-    targets: dict
+    contributions: dict
     train_ids: pd.Index
 
     def missing(self, omic):
-        target = self.targets[omic]
-        return target.index[target.isna().any(axis=1)]
+        part = self.contributions[omic]
+        return part.index[part.isna().any(axis=1)]
+
+    def predictable(self, omic):
+        """Samples missing `omic` whose other omic is observed (a sample missing both has no omic input)."""
+        missing = self.missing(omic)
+        return missing[self.views[OTHER[omic]].loc[missing].notna().all(axis=1)]
 
     def standardized(self, view, rows):
         X = self.views[view]
@@ -179,6 +236,7 @@ class Context:
 
 def local_affinity(X, K=20, mu=0.5):
     """Scaled exponential affinity as in SNF: the kernel width adapts to each pair's neighbourhood density."""
+    K = min(K, len(X) - 1)
     D = squareform(pdist(X))
     knn_mean = np.sort(D, axis=1)[:, 1:K + 1].mean(axis=1)
     width = np.maximum(mu * (knn_mean[:, None] + knn_mean[None, :] + D) / 3.0, np.finfo(float).eps)
@@ -186,41 +244,93 @@ def local_affinity(X, K=20, mu=0.5):
 
 
 def snf_predictor(ctx, K=20, k_pred=20, T=20, mu=0.5):
-    """Missing omic's features = weighted mean over the sample's strongest fused links to training samples."""
+    """
+    Missing omic's part = weighted mean over the sample's strongest fused links to training samples.
+
+    Returns, per omic, the predicted parts indexed by sample. A sample missing both omics (none in
+    MetaCardis) has nothing to link on and gets the training mean.
+    """
     n_train = len(ctx.train_ids)
-    k_pred = min(k_pred, n_train)
+    K, k_pred = min(K, n_train - 1), min(k_pred, n_train)
     predictions = {}
     for omic in OMICS:
-        nodes = ctx.train_ids.append(ctx.missing(omic))
-        affinities = [local_affinity(ctx.standardized(view, nodes), K, mu) for view in (OTHER[omic], "meta")]
-        links = snf(affinities, K=K, T=T, minmax=False)[n_train:, :n_train]
-        kth_strongest = -np.partition(-links, k_pred - 1, axis=1)[:, [k_pred - 1]]
-        links = np.where(links >= kth_strongest, links, 0.0)
-        train_features = ctx.targets[omic].loc[ctx.train_ids].to_numpy()
-        predictions[omic] = (links / links.sum(axis=1, keepdims=True)) @ train_features
+        train_parts = ctx.contributions[omic].loc[ctx.train_ids].to_numpy()
+        missing, queries = ctx.missing(omic), ctx.predictable(omic)
+        predicted = pd.DataFrame(np.tile(train_parts.mean(axis=0), (len(missing), 1)), index=missing)
+        if len(queries):
+            nodes = ctx.train_ids.append(queries)
+            affinities = [local_affinity(ctx.standardized(view, nodes), K, mu) for view in (OTHER[omic], "meta")]
+            links = snf(affinities, K=K, T=T, minmax=False)[n_train:, :n_train]
+            kth_strongest = -np.partition(-links, k_pred - 1, axis=1)[:, [k_pred - 1]]
+            links = np.where(links >= kth_strongest, links, 0.0)
+            weights = links / np.maximum(links.sum(axis=1, keepdims=True), np.finfo(float).eps)
+            predicted.loc[queries] = weights @ train_parts
+        predictions[omic] = predicted
     return predictions
 
 
-def pipeline_distance(split, meta, mb_cols, mt_cols, **params):
-    """Distance matrix over all samples of the split: missing omics filled in by SNF neighbours."""
-    space = FeatureSpace(split.train, mb_cols, mt_cols)
-    combined = split.combined
+def complete_scores(combined, train_ids, meta, mb_cols, mt_cols, **params):
+    """2-D scores of every sample in `combined`: observed parts exact, missing parts from SNF neighbours."""
+    space = ScoreSpace(combined.loc[train_ids], mb_cols, mt_cols)
     views = {
         "mb": omic_features(combined[mb_cols], "mb"),
         "mt": omic_features(combined[mt_cols], "mt"),
         "meta": meta.loc[combined.index],
     }
-    ctx = Context(views, space.blocks(combined), split.train.index)
+    ctx = Context(views, space.contributions(combined), pd.Index(train_ids))
     for omic, predicted in snf_predictor(ctx, **params).items():
-        ctx.targets[omic].loc[ctx.missing(omic)] = predicted
-    return distance_matrix(space.combine(ctx.targets))
+        ctx.contributions[omic].loc[predicted.index] = predicted.to_numpy()
+    return space.combine(ctx.contributions)
+
+
+def pipeline_distance(split, meta, mb_cols, mt_cols, **params):
+    """Distance matrix over all samples of the split: missing parts of the scores filled in by SNF neighbours."""
+    return distance_matrix(complete_scores(split.combined, split.train.index, meta, mb_cols, mt_cols, **params))
 
 
 def knn50_distance(split, mb_cols, mt_cols):
-    """Milestone 1 benchmark: KNN50 imputation, distances in the same feature space."""
+    """Milestone 1 benchmark: KNN50 imputation, distances measured in the same 2-PC score space."""
     reconstructed = reconstruct_knn(split.combined, split.train.index, n_neighbors=50)
-    space = FeatureSpace(split.train, mb_cols, mt_cols)
-    return distance_matrix(space.combine(space.blocks(reconstructed)))
+    space = ScoreSpace(split.train, mb_cols, mt_cols)
+    return distance_matrix(space.combine(space.contributions(reconstructed)))
+
+# ==========================================
+# 3b. FULL COHORT (THE SUBMISSION)
+# ==========================================
+
+def fill_scattered_gaps(data, complete_ids, mb_cols, mt_cols):
+    """
+    A sample counts as missing an omic only when that whole omic is NaN. Single NaN values inside
+    an observed omic would break the scaler/PCA, so they get the feature's median over the
+    complete samples. MetaCardis has none.
+    """
+    data = data.copy()
+    medians = data.loc[complete_ids].median()
+    for cols in (mb_cols, mt_cols):
+        observed = data[cols].notna().any(axis=1)
+        block = data.loc[observed, cols]
+        data.loc[observed, cols] = block.fillna(medians[cols])
+    return data
+
+
+def predict_full_cohort(mb_path, mt_path, meta_path, params=None, tune_metric="spearman"):
+    """
+    Run the pipeline on a whole cohort: every sample in the three files, with its real missingness.
+
+    The complete samples are the reference (scaler, PCA, training nodes). With params=None, K and
+    k_pred are tuned on an inner masked split of the complete samples only (same protocol as the
+    experiments). Returns the n x n distance DataFrame and the parameters used.
+    """
+    data, complete, mb_cols, mt_cols, metadata = load_data(mb_path, mt_path, meta_path)
+    if len(complete) < 10:
+        raise ValueError(f"only {len(complete)} complete samples in {Path(mb_path).parent}; too few to fit the pipeline")
+    data = fill_scattered_gaps(data, complete.index, mb_cols, mt_cols)
+    complete = data.loc[complete.index]
+    meta = metadata_features(metadata.loc[data.index])
+    if params is None:
+        params = tune(complete, meta, mb_cols, mt_cols, tune_metric)
+    scores = complete_scores(data, complete.index, meta, mb_cols, mt_cols, **params)
+    return distance_matrix(scores), params
 
 # ==========================================
 # 4. TUNING & EVALUATION
@@ -351,34 +461,86 @@ def plot_sweep(sweep, path):
             ax.set_ylabel(f"Mantel r ({metric.capitalize()}) vs ground truth")
             ax.grid(alpha=0.3)
     axes[0, 1].legend(fontsize=8)
-    fig.suptitle("SNF neighbours vs KNN50: distances over the standard-scaled features")
+    fig.suptitle("SNF neighbours vs KNN50: distances on the first two PCs (score space)")
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
     print(f"figure saved to {path}")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate the SNF neighbours pipeline against the KNN50 benchmark.")
-    parser.add_argument("--splits", type=int, default=10, help="extra random splits for the paired comparison (0 skips)")
-    parser.add_argument("--permutations", type=int, default=999, help="Mantel permutations on the main split")
-    parser.add_argument("--sweep-seeds", type=int, default=3, help="repeats per missing fraction in the sweep (0 skips)")
-    parser.add_argument("--fractions", default="0.1,0.2,0.4,0.6,0.8",
-                        help="comma-separated shares of all samples that lose one omic in the sweep")
-    parser.add_argument("--sweep-retune", action="store_true",
-                        help="tune inside every sweep split instead of reusing the main split's parameters (slower)")
-    parser.add_argument("--tune-metric", choices=METRICS, default="spearman",
-                        help="Mantel correlation that the parameter tuning maximises (both are always reported)")
-    parser.add_argument("--data-dir", default=".", help="folder containing microbiome.csv, metabolome.csv, metadata.csv")
-    parser.add_argument("--out", default="results", help="folder for the CSV tables and the figure")
-    return parser.parse_args()
-
 # ==========================================
-# 6. EXECUTION
+# 6. SUBMISSION (FULL COHORTS)
 # ==========================================
 
-if __name__ == "__main__":
-    args = parse_args()
+DEFAULT_COHORTS = {
+    "metacardis": Path("."),
+    "franzosa": Path("prepared_datasets") / "franzosa",
+    "yachida": Path("prepared_datasets") / "yachida",
+}
+FILES = ("microbiome.csv", "metabolome.csv", "metadata.csv")
+
+
+def input_sample_ids(folder):
+    """Every sample ID that appears in any of the cohort's three files."""
+    ids = set()
+    for name in FILES:
+        index = pd.read_csv(folder / name, index_col=0, usecols=[0]).index
+        ids |= set(index.astype(str).str.strip())
+    return ids
+
+
+def validate_submission(distances, expected_ids, name):
+    """The matrix must cover every input sample exactly once and be a valid distance matrix."""
+    labels = list(distances.index)
+    assert labels == list(distances.columns), f"{name}: row and column labels differ"
+    assert len(set(labels)) == len(labels), f"{name}: duplicate sample IDs"
+    missing, extra = expected_ids - set(labels), set(labels) - expected_ids
+    assert not missing, f"{name}: {len(missing)} input samples are missing from the matrix"
+    assert not extra, f"{name}: {len(extra)} samples in the matrix are not in the input files"
+    values = distances.to_numpy()
+    assert np.isfinite(values).all(), f"{name}: NaN or Inf distances"
+    assert np.allclose(values, values.T, atol=1e-10), f"{name}: matrix is not symmetric"
+    assert np.allclose(np.diag(values), 0.0, atol=1e-12), f"{name}: non-zero diagonal"
+    assert (values >= 0).all(), f"{name}: negative distances"
+
+
+def run_submission(args):
+    cohorts = dict(DEFAULT_COHORTS)
+    if args.cohort:
+        cohorts = {}
+        for item in args.cohort:
+            name, _, folder = item.partition("=")
+            cohorts[name] = Path(folder)
+    params = None if args.K is None else {"K": args.K, "k_pred": args.k_pred}
+    out_dir = Path(args.submission_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = []
+    for name, folder in cohorts.items():
+        print("=" * 70)
+        print(f"Cohort: {name}  ({folder})")
+        if not all((folder / file).exists() for file in FILES):
+            print(f"Skipped: {folder} does not contain {', '.join(FILES)}")
+            continue
+        distances, used = predict_full_cohort(*(folder / file for file in FILES), params=params,
+                                              tune_metric=args.tune_metric)
+        validate_submission(distances, input_sample_ids(folder), name)
+        out_path = out_dir / f"student_res_{name}.csv"
+        distances.to_csv(out_path)
+        print(f"Saved {out_path} | shape {distances.shape} | parameters {used}")
+        summary.append({"Cohort": name, "Samples": len(distances), **used,
+                        "Tuned": params is None, "Tune_metric": args.tune_metric if params is None else "-"})
+
+    if summary:
+        pd.DataFrame(summary).to_csv(out_dir / "submission_params.csv", index=False)
+        print("=" * 70)
+        print(pd.DataFrame(summary).to_string(index=False))
+
+# ==========================================
+# 7. EXPERIMENTS
+# ==========================================
+
+def run_experiments(args):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     order = [BENCHMARK, PIPELINE]
@@ -456,3 +618,47 @@ if __name__ == "__main__":
         plot_sweep(sweep, out / "missing_sweep.png")
 
     print(f"\nTables saved to {out}/")
+
+# ==========================================
+# 8. COMMAND LINE
+# ==========================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="SNF neighbours, the final pipeline: write the submission matrices (default) "
+                    "or run the experiments against the KNN50 benchmark.")
+    parser.add_argument("mode", nargs="?", choices=("submit", "experiments"), default="submit",
+                        help="submit (default): n x n matrices per cohort; experiments: simulated missingness")
+    parser.add_argument("--tune-metric", choices=METRICS, default="spearman",
+                        help="Mantel correlation that the parameter tuning maximises (both are always reported)")
+
+    submit = parser.add_argument_group("submit mode")
+    submit.add_argument("--cohort", action="append", default=[], metavar="NAME=FOLDER",
+                        help="cohort to run, replacing the default three (repeatable)")
+    submit.add_argument("--submission-dir", default=".", help="folder for student_res_<cohort>.csv")
+    submit.add_argument("--K", type=int, help="fix K instead of tuning (needs --k-pred too)")
+    submit.add_argument("--k-pred", type=int, help="fix k_pred instead of tuning (needs --K too)")
+
+    experiments = parser.add_argument_group("experiments mode")
+    experiments.add_argument("--data-dir", default=".", help="folder containing microbiome.csv, metabolome.csv, metadata.csv")
+    experiments.add_argument("--out", default="results", help="folder for the CSV tables and the figure")
+    experiments.add_argument("--splits", type=int, default=10, help="extra random splits for the paired comparison (0 skips)")
+    experiments.add_argument("--permutations", type=int, default=999, help="Mantel permutations on the main split")
+    experiments.add_argument("--sweep-seeds", type=int, default=3, help="repeats per missing fraction in the sweep (0 skips)")
+    experiments.add_argument("--fractions", default="0.1,0.2,0.4,0.6,0.8",
+                             help="comma-separated shares of all samples that lose one omic in the sweep")
+    experiments.add_argument("--sweep-retune", action="store_true",
+                             help="tune inside every sweep split instead of reusing the main split's parameters (slower)")
+
+    args = parser.parse_args()
+    if (args.K is None) != (args.k_pred is None):
+        parser.error("--K and --k-pred must be given together")
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.mode == "submit":
+        run_submission(args)
+    else:
+        run_experiments(args)

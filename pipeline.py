@@ -25,29 +25,53 @@ PATIENT_GROUP_COL = "PATGROUPFINAL_C"
 # 1. DATA LOADING & EVALUATION TOOLS
 # ==========================================
 
+def _read_table(path):
+    """CSV with sample IDs in the first column, IDs as stripped strings."""
+    table = pd.read_csv(path, index_col=0)
+    table.index = table.index.astype(str).str.strip()
+    return table
+
+
 def load_data(microbiome_path="microbiome.csv", metabolome_path="metabolome.csv", metadata_path="metadata.csv"):
-    microbiome = pd.read_csv(microbiome_path, index_col=0)
-    metabolome = pd.read_csv(metabolome_path, index_col=0)
-    metadata = pd.read_csv(metadata_path, index_col=0)
+    """
+    Load the three tables over the UNION of their sample IDs, in microbiome-file order.
 
-    # Ensure all data frames align
-    common = microbiome.index.intersection(metabolome.index).intersection(metadata.index)
-    microbiome = microbiome.loc[common]
-    metabolome = metabolome.loc[common]
-    metadata = metadata.loc[common]
+    A sample absent from an omic file is treated as missing that omic (all-NaN row), so no sample
+    is dropped from the n x n output. Feature values are coerced to numbers, and features with no
+    value at all are dropped. A sample is complete when neither omic is entirely NaN.
+    """
+    microbiome = _read_table(microbiome_path)
+    metabolome = _read_table(metabolome_path)
+    metadata = _read_table(metadata_path)
 
-    data = microbiome.join(metabolome, how="inner")
+    ids = microbiome.index.union(metabolome.index, sort=False).union(metadata.index, sort=False)
+    for name, table in (("microbiome", microbiome), ("metabolome", metabolome), ("metadata", metadata)):
+        absent = len(ids.difference(table.index))
+        if absent:
+            print(f"Warning: {absent} samples are absent from the {name} file; they are kept as missing it.")
+    microbiome = microbiome.reindex(ids).apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
+    metabolome = metabolome.reindex(ids).apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
+    metadata = metadata.reindex(ids)
+
+    # The same feature name in both omics would collide when the tables are joined.
+    overlap = microbiome.columns.intersection(metabolome.columns)
+    if len(overlap):
+        microbiome = microbiome.rename(columns={c: f"mb__{c}" for c in overlap})
+        metabolome = metabolome.rename(columns={c: f"mt__{c}" for c in overlap})
+
+    data = microbiome.join(metabolome)
     mb_cols = list(microbiome.columns)
     mt_cols = list(metabolome.columns)
 
     mb_missing = data[mb_cols].isna().all(axis=1)
     mt_missing = data[mt_cols].isna().all(axis=1)
-    
+
     complete = data.loc[~mb_missing & ~mt_missing].copy()
-    
+
     print(f"Total Subjects: {len(data)}")
-    print(f"Complete Subjects (Both Omics & Metadata): {len(complete)}")
-    
+    print(f"Complete Subjects (both omics): {len(complete)} | missing microbiome: {int(mb_missing.sum())}"
+          f" | missing metabolome: {int(mt_missing.sum())}")
+
     return data, complete, mb_cols, mt_cols, metadata
 
 def make_mask(index, rng):
